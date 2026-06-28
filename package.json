@@ -1,0 +1,41 @@
+{
+  "name": "piper-tts-demo",
+  "private": true,
+  "version": "0.2.0",
+  "type": "module",
+  "main": "desktop/main.js",
+  "scripts": {
+    "dev": "vite",
+    "format": "prettier --write .",
+    "build": "vite build",
+    "build:desktop": "node scripts/build-desktop.js",
+    "desktop": "npm run build:desktop && electron .",
+    "desktop:dev": "node scripts/run-desktop-dev.js",
+    "lint": "eslint .",
+    "preview": "vite preview",
+    "pipeline:local": "node scripts/run-document-pipeline.js",
+    "server:local": "node server/api-server.js"
+  },
+  "dependencies": {
+    "lucide-vue-next": "^0.539.0",
+    "mammoth": "^1.12.0",
+    "onnxruntime-node": "^1.22.0",
+    "onnxruntime-web": "^1.22.0",
+    "pdfjs-dist": "^5.7.284",
+    "phonemizer": "file:phonemizer-1.2.2.tgz",
+    "sherpa-onnx": "^1.12.25",
+    "tailwindcss": "^4.1.11",
+    "vue": "^3.5.18",
+    "vue-router": "^5.0.2"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.33.0",
+    "@tailwindcss/vite": "^4.1.11",
+    "@vitejs/plugin-vue": "^6.0.1",
+    "electron": "^42.3.3",
+    "eslint": "^9.33.0",
+    "eslint-plugin-vue": "^10.4.0",
+    "prettier": "^3.6.2",
+    "vite": "^7.1.1"
+  }
+}
