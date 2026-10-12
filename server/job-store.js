@@ -33,6 +33,7 @@ export class JobStore {
     inputMode = 'path',
     modelName = 'ngochuyen',
     originalFilename = null,
+    outputDirectory = null,
     speed = 1,
   }) {
     await this.init();
@@ -48,6 +49,7 @@ export class JobStore {
       inputMode,
       modelName,
       originalFilename,
+      outputDirectory,
       speed,
       status: 'queued',
       stage: 'queued',

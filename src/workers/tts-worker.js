@@ -112,9 +112,9 @@ self.addEventListener('message', async (event) => {
     const speakerId = typeof voice === 'number' ? voice : parseInt(voice, 10) || 0;
     const lengthScale = 1.0 / (speed || 1.0);
     const pcmSegments = [];
-    let totalSamples = 0;
     let sampleRate = 22050;
     let processedCount = 0;
+    let pacedSampleCount = 0;
 
     postProgress({
       phase: 'chunking',
@@ -143,14 +143,24 @@ self.addEventListener('message', async (event) => {
       });
 
       const stream = tts.stream(createChunkStream(batchChunks), { speakerId, lengthScale });
+      let batchProcessedCount = 0;
 
-      for await (const { audio } of stream) {
+      for await (const { audio, text: chunkTextValue } of stream) {
         throwIfCancelled();
 
+        const sourceChunk = batchChunks[batchProcessedCount];
         sampleRate = audio.sampling_rate;
-        pcmSegments.push(float32ToInt16(audio.audio));
-        totalSamples += audio.audio.length;
+        pcmSegments.push({
+          pause: getChunkPause(sourceChunk),
+          samples: float32ToInt16(audio.audio),
+          text: chunkTextValue,
+        });
+        batchProcessedCount += 1;
         processedCount += 1;
+        pacedSampleCount += audio.audio.length;
+        if (processedCount > 1) {
+          pacedSampleCount += Math.round(sampleRate * getPauseSecondsForText(pcmSegments[processedCount - 2]));
+        }
 
         postProgress({
           phase: 'generating',
@@ -161,7 +171,7 @@ self.addEventListener('message', async (event) => {
             totalBatches: batches.length,
             processedChunks: processedCount,
             totalChunks,
-            estimatedAudioSeconds: Math.round(totalSamples / sampleRate),
+            estimatedAudioSeconds: Math.round(pacedSampleCount / sampleRate),
           },
         });
       }
@@ -179,7 +189,7 @@ self.addEventListener('message', async (event) => {
       },
     });
 
-    const audio = createWavBlobFromSegments(pcmSegments, totalSamples, sampleRate);
+    const audio = createWavBlobFromSegments(createPacedPcmSegments(pcmSegments, sampleRate), sampleRate);
     self.postMessage({ status: 'complete', audio });
   } catch (error) {
     if (error instanceof Error && error.message === 'cancelled') {
@@ -269,7 +279,7 @@ function createSentenceBatches(chunks, maxBatchChars = 900, maxBatchSentences = 
   let currentChars = 0;
 
   for (const chunk of chunks) {
-    const chunkLength = chunk.length;
+    const chunkLength = getChunkText(chunk).length;
     const shouldSplit =
       currentBatch.length > 0 &&
       (currentBatch.length >= maxBatchSentences || currentChars + chunkLength > maxBatchChars);
@@ -293,8 +303,16 @@ function createSentenceBatches(chunks, maxBatchChars = 900, maxBatchSentences = 
 
 async function* createChunkStream(chunks) {
   for (const chunk of chunks) {
-    yield chunk;
+    yield getChunkText(chunk);
   }
+}
+
+function getChunkText(chunk) {
+  return typeof chunk === 'string' ? chunk : String(chunk?.text || '');
+}
+
+function getChunkPause(chunk) {
+  return typeof chunk === 'object' ? chunk.pause || '' : '';
 }
 
 function float32ToInt16(input) {
@@ -306,7 +324,95 @@ function float32ToInt16(input) {
   return pcm;
 }
 
-function createWavBlobFromSegments(segments, totalSamples, sampleRate) {
+function createPacedPcmSegments(segments, sampleRate) {
+  const pacedSegments = [];
+
+  for (let index = 0; index < segments.length; index += 1) {
+    const { pause, samples, text } = segments[index];
+    pacedSegments.push(applyEdgeFade(samples, sampleRate));
+
+    if (index < segments.length - 1) {
+      const pauseSamples = Math.round(sampleRate * getPauseSecondsForText({ pause, text }));
+      if (pauseSamples > 0) {
+        pacedSegments.push(new Int16Array(pauseSamples));
+      }
+    }
+  }
+
+  return pacedSegments;
+}
+
+function applyEdgeFade(samples, sampleRate, fadeSeconds = 0.008) {
+  const faded = new Int16Array(samples);
+  const fadeSamples = Math.min(
+    Math.floor(sampleRate * fadeSeconds),
+    Math.floor(faded.length / 2),
+  );
+
+  if (fadeSamples <= 1) {
+    return faded;
+  }
+
+  for (let index = 0; index < fadeSamples; index += 1) {
+    const gain = index / fadeSamples;
+    faded[index] = Math.round(faded[index] * gain);
+    faded[faded.length - 1 - index] = Math.round(faded[faded.length - 1 - index] * gain);
+  }
+
+  return faded;
+}
+
+function getPauseSecondsForText(chunk) {
+  const value = typeof chunk === 'string'
+    ? chunk.trim()
+    : String(chunk?.text || '').trim();
+  const pause = typeof chunk === 'object' ? chunk.pause : '';
+
+  if (pause === 'ellipsis' || /…|\.\.\.\s*$/.test(value)) {
+    return 0.48;
+  }
+
+  if (pause === 'paragraph') {
+    return 0.36;
+  }
+
+  if (pause === 'expressive') {
+    return 0.28;
+  }
+
+  if (pause === 'short-sentence') {
+    return 0.13;
+  }
+
+  if (pause === 'sentence') {
+    return 0.2;
+  }
+
+  if (pause === 'clause') {
+    return 0.09;
+  }
+
+  if (!value) {
+    return 0.07;
+  }
+
+  if (/[?!]\s*$/.test(value)) {
+    return 0.28;
+  }
+
+  if (/[.?!]\s*$/.test(value)) {
+    return value.length <= 34 ? 0.13 : 0.2;
+  }
+
+  if (/[,;:]\s*$/.test(value)) {
+    return 0.09;
+  }
+
+  return 0.07;
+}
+
+function createWavBlobFromSegments(segments, sampleRate) {
+  const totalSamples = segments.reduce((sum, segment) => sum + segment.length, 0);
   const buffer = new ArrayBuffer(44 + totalSamples * 2);
   const view = new DataView(buffer);
 

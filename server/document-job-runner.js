@@ -1,20 +1,29 @@
-import { stat, writeFile } from 'node:fs/promises';
+import { mkdir, rm, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
-import { mergeFloat32Chunks, mergeWavFiles, mergeWavFilesInParts, readWavSampleRate, writeWavFromFloat32 } from './audio-utils.js';
+import {
+  mergeFloat32ChunksWithPauses,
+  mergeWavFiles,
+  readWavSampleRate,
+  writeWavFromFloat32,
+} from './audio-utils.js';
 import { importTextFromPath } from './import-text-node.js';
 import { segmentDocumentText } from './document-segmenter.js';
 import { getVietnameseModelPaths } from './model-paths.js';
 import { NodePiperTTS } from './node-piper-tts.js';
 import { nodeTextCleaner } from './node-text-resources.js';
+import { sanitizeOutputBaseName } from './output-name.js';
 import { getJobDirectory } from './runtime-paths.js';
 
-const MODEL_RELOAD_SEGMENT_INTERVAL = 12;
-const PART_MAX_DATA_BYTES = 512 * 1024 * 1024;
+const DEFAULT_MODEL_RELOAD_SEGMENT_INTERVAL = 0;
 const HUGE_BROWSER_DOWNLOAD_CHARS = 500_000;
 const WAV_MAX_DATA_BYTES = 0xffff_ffff - 36;
 const MAX_CHUNK_FALLBACK_DEPTH = 5;
 const MIN_CHUNK_FALLBACK_CHARS = 120;
+const DEFAULT_CHUNK_SYNTHESIS_TIMEOUT_MS = 120_000;
+const FINAL_OUTPUT_DIRECTORY_ENV = 'TTS_FINAL_OUTPUT_DIR';
+const FINAL_OUTPUT_FILENAME = 'chuong';
+const COMPLETED_MARKER_FILENAME = 'tts-completed.json';
 
 function countWords(text) {
   return String(text || '').trim().split(/\s+/).filter(Boolean).length;
@@ -39,6 +48,79 @@ function formatJobError(error) {
   }
 
   return String(error);
+}
+
+function nowMs() {
+  return Date.now();
+}
+
+function getModelReloadSegmentInterval() {
+  const configured = Number(process.env.TTS_MODEL_RELOAD_SEGMENT_INTERVAL);
+  return Number.isFinite(configured) && configured > 0
+    ? Math.floor(configured)
+    : DEFAULT_MODEL_RELOAD_SEGMENT_INTERVAL;
+}
+
+function getChunkSynthesisTimeoutMs() {
+  const configured = Number(process.env.TTS_CHUNK_SYNTHESIS_TIMEOUT_MS);
+  return Number.isFinite(configured) && configured > 0
+    ? Math.floor(configured)
+    : DEFAULT_CHUNK_SYNTHESIS_TIMEOUT_MS;
+}
+
+async function withTimeout(promise, timeoutMs, message) {
+  let timeoutId = null;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timeoutId = setTimeout(() => reject(new Error(message)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timeoutId) {
+      clearTimeout(timeoutId);
+    }
+  }
+}
+
+function getFinalOutputPath(job, jobId, fallbackDirectory, format) {
+  const jobOutputDirectory = typeof job.outputDirectory === 'string' ? job.outputDirectory.trim() : '';
+  const configuredDirectory = jobOutputDirectory || String(process.env[FINAL_OUTPUT_DIRECTORY_ENV] || '').trim();
+  const sourceFilename = job.originalFilename || path.basename(job.inputPath || '');
+  const outputBaseName = sanitizeOutputBaseName(sourceFilename, jobId);
+  const outputExtension = format === 'rf64' ? '.rf64.wav' : '.wav';
+  const outputDirectory = configuredDirectory
+    ? path.join(path.resolve(configuredDirectory), outputBaseName)
+    : fallbackDirectory;
+
+  return {
+    configured: Boolean(configuredDirectory),
+    outputDirectory,
+    outputPath: path.join(outputDirectory, `${FINAL_OUTPUT_FILENAME}${outputExtension}`),
+  };
+}
+
+async function cleanupTemporaryAudioFiles(segmentPaths) {
+  const cleanupTargets = segmentPaths.map((filePath) => ({ filePath, type: 'segment' }));
+  const results = await Promise.allSettled(
+    cleanupTargets.map(({ filePath }) => rm(filePath, { force: true, recursive: true })),
+  );
+
+  const failed = results
+    .map((result, index) => ({ result, target: cleanupTargets[index] }))
+    .filter(({ result }) => result.status === 'rejected')
+    .map(({ result, target }) => ({
+      path: target.filePath,
+      type: target.type,
+      error: result.reason instanceof Error ? result.reason.message : String(result.reason),
+    }));
+
+  return {
+    cleaned: failed.length === 0,
+    deletedTargets: cleanupTargets.length - failed.length,
+    failed,
+  };
 }
 
 function sanitizeProblemChunk(text) {
@@ -76,9 +158,24 @@ function splitChunkForFallback(text) {
   return [value.slice(0, splitIndex).trim(), value.slice(splitIndex).trim()].filter(Boolean);
 }
 
+function getChunkText(chunk) {
+  return typeof chunk === 'string' ? chunk : String(chunk?.text || '');
+}
+
 export async function runDocumentJob(jobStore, jobId) {
   const job = await jobStore.getJob(jobId);
   let tts = null;
+  const jobStartedAtMs = nowMs();
+  const timing = {
+    cleanupMs: 0,
+    inputMs: 0,
+    mergeMs: 0,
+    modelLoadMs: 0,
+    modelReloadMs: 0,
+    preprocessingMs: 0,
+    segmentWriteMs: 0,
+    synthesizeMs: 0,
+  };
 
   await jobStore.updateJob(jobId, (current) => ({
     ...current,
@@ -88,12 +185,18 @@ export async function runDocumentJob(jobStore, jobId) {
   }));
 
   try {
+    const inputStartedAtMs = nowMs();
     const rawText = await importTextFromPath(job.inputPath);
     const segments = segmentDocumentText(rawText);
+    timing.inputMs += nowMs() - inputStartedAtMs;
     const modelName = job.modelName || 'ngochuyen';
     const speed = Number(job.speed) > 0 ? Number(job.speed) : 1;
     const modelPaths = getVietnameseModelPaths(modelName);
+    const modelReloadSegmentInterval = getModelReloadSegmentInterval();
+    const chunkSynthesisTimeoutMs = getChunkSynthesisTimeoutMs();
+    const modelLoadStartedAtMs = nowMs();
     tts = await NodePiperTTS.fromFiles(modelPaths);
+    timing.modelLoadMs += nowMs() - modelLoadStartedAtMs;
     const jobDirectory = getJobDirectory(jobId);
     const segmentRows = ['index,chars,words,processedChars,chunkCount,skippedChunkCount,audioPath'];
     const failedChunkRows = ['segmentIndex,chunkIndex,depth,chars,error,preview'];
@@ -102,7 +205,9 @@ export async function runDocumentJob(jobStore, jobId) {
       if (tts) {
         await tts.dispose().catch(() => {});
       }
+      const reloadStartedAtMs = nowMs();
       tts = await NodePiperTTS.fromFiles(modelPaths);
+      timing.modelReloadMs += nowMs() - reloadStartedAtMs;
     }
 
     async function synthesizeChunkWithFallback(chunk, context, depth = 0) {
@@ -112,17 +217,25 @@ export async function runDocumentJob(jobStore, jobId) {
 
       for (const attemptText of attemptTexts) {
         try {
-          return await tts.synthesizeChunk(attemptText, {
-            lengthScale: 1.0 / speed,
-          });
+          return await withTimeout(
+            tts.synthesizeChunk(attemptText, {
+              lengthScale: 1.0 / speed,
+            }),
+            chunkSynthesisTimeoutMs,
+            `Qua thoi gian tao audio chunk ${context.segmentIndex}.${context.chunkIndex} sau ${chunkSynthesisTimeoutMs}ms`,
+          );
         } catch (error) {
           lastError = error;
 
           try {
             await reloadTts();
-            return await tts.synthesizeChunk(attemptText, {
-              lengthScale: 1.0 / speed,
-            });
+            return await withTimeout(
+              tts.synthesizeChunk(attemptText, {
+                lengthScale: 1.0 / speed,
+              }),
+              chunkSynthesisTimeoutMs,
+              `Qua thoi gian retry audio chunk ${context.segmentIndex}.${context.chunkIndex} sau ${chunkSynthesisTimeoutMs}ms`,
+            );
           } catch (retryError) {
             lastError = retryError;
           }
@@ -145,7 +258,10 @@ export async function runDocumentJob(jobStore, jobId) {
 
           fallbackSampleRate = renderedPart.sampleRate || fallbackSampleRate;
           if (!renderedPart.skipped && renderedPart.samples?.length) {
-            renderedParts.push(renderedPart.samples);
+            renderedParts.push({
+              samples: renderedPart.samples,
+              text: fallbackParts[partIndex],
+            });
           }
         }
 
@@ -153,7 +269,7 @@ export async function runDocumentJob(jobStore, jobId) {
           return {
             reason: 'fallback-split',
             sampleRate: fallbackSampleRate || 22050,
-            samples: mergeFloat32Chunks(renderedParts),
+            samples: mergeFloat32ChunksWithPauses(renderedParts, fallbackSampleRate || 22050),
             skipped: false,
           };
         }
@@ -234,8 +350,10 @@ export async function runDocumentJob(jobStore, jobId) {
         continue;
       }
 
+      const preprocessingStartedAtMs = nowMs();
       const processedText = await nodeTextCleaner.processTextForTTS(segment.text);
       const chunks = await nodeTextCleaner.chunkText(processedText);
+      timing.preprocessingMs += nowMs() - preprocessingStartedAtMs;
       totalChunks += chunks.length;
       const renderedChunks = [];
       let skippedInSegment = 0;
@@ -255,11 +373,28 @@ export async function runDocumentJob(jobStore, jobId) {
 
       for (let chunkIndex = 0; chunkIndex < chunks.length; chunkIndex += 1) {
         const chunk = chunks[chunkIndex];
-        const rendered = await synthesizeChunkWithFallback(chunk, {
+        const chunkText = getChunkText(chunk);
+        const synthesizeStartedAtMs = nowMs();
+        const rendered = await synthesizeChunkWithFallback(chunkText, {
           chunkIndex: chunkIndex + 1,
           segmentIndex: segment.index + 1,
         });
+        timing.synthesizeMs += nowMs() - synthesizeStartedAtMs;
         sampleRate = rendered.sampleRate;
+
+        await jobStore.updateJob(jobId, (current) => ({
+          ...current,
+          stage: 'synthesizing',
+          progress: {
+            ...current.progress,
+            completedChunks: completedChunks + chunkIndex + 1,
+            completedSegments: segment.index,
+            currentChunkInSegment: chunkIndex + 1,
+            totalChunks,
+            totalChunksInSegment: chunks.length,
+            totalSegments: segments.length,
+          },
+        }));
 
         if (rendered.skipped || !rendered.samples || rendered.samples.length === 0) {
           skippedChunks += 1;
@@ -267,19 +402,30 @@ export async function runDocumentJob(jobStore, jobId) {
           continue;
         }
 
-        renderedChunks.push(rendered.samples);
+        renderedChunks.push({
+          pause: chunk.pause,
+          samples: rendered.samples,
+          text: chunkText,
+        });
       }
 
       completedChunks += chunks.length;
 
       if (renderedChunks.length === 0) {
         const fallbackSampleRate = sampleRate || 22050;
-        renderedChunks.push(new Float32Array(Math.round(fallbackSampleRate * 0.2)));
+        renderedChunks.push({
+          samples: new Float32Array(Math.round(fallbackSampleRate * 0.2)),
+          text: '',
+        });
         sampleRate = fallbackSampleRate;
       }
 
-      const mergedSamples = mergeFloat32Chunks(renderedChunks);
+      const mergedSamples = mergeFloat32ChunksWithPauses(renderedChunks, sampleRate, {
+        includeTrailingPause: true,
+      });
+      const segmentWriteStartedAtMs = nowMs();
       await writeWavFromFloat32(audioPath, mergedSamples, sampleRate);
+      timing.segmentWriteMs += nowMs() - segmentWriteStartedAtMs;
       segmentAudioPaths.push(audioPath);
 
       processedSegments.push({
@@ -291,7 +437,7 @@ export async function runDocumentJob(jobStore, jobId) {
         audioPath,
         skippedChunkCount: skippedInSegment,
         processedPreview: processedText.slice(0, 240),
-        firstChunkPreview: chunks[0]?.slice(0, 240) || '',
+        firstChunkPreview: getChunkText(chunks[0]).slice(0, 240),
       });
       segmentRows.push([
         segment.index,
@@ -316,9 +462,15 @@ export async function runDocumentJob(jobStore, jobId) {
         },
       }));
 
-      if ((segment.index + 1) % MODEL_RELOAD_SEGMENT_INTERVAL === 0 && segment.index + 1 < segments.length) {
+      if (
+        modelReloadSegmentInterval > 0
+        && (segment.index + 1) % modelReloadSegmentInterval === 0
+        && segment.index + 1 < segments.length
+      ) {
         await tts.dispose();
+        const reloadStartedAtMs = nowMs();
         tts = await NodePiperTTS.fromFiles(modelPaths);
+        timing.modelReloadMs += nowMs() - reloadStartedAtMs;
       }
     }
 
@@ -335,24 +487,33 @@ export async function runDocumentJob(jobStore, jobId) {
       },
     }));
 
-    const outputDirectory = path.join(jobDirectory, 'audio-parts');
-    const audioParts = await mergeWavFilesInParts(segmentAudioPaths, outputDirectory, {
-      baseName: 'part',
-      maxDataBytes: PART_MAX_DATA_BYTES,
-      sampleRate: sampleRate || 22050,
-    });
-    const partAudioPaths = audioParts.map((part) => part.path);
-    const totalPartDataBytes = audioParts.reduce((sum, part) => sum + part.dataBytes, 0);
-    const mergedAudioPath = path.join(
-      jobDirectory,
-      totalPartDataBytes > WAV_MAX_DATA_BYTES ? 'merged-full.rf64.wav' : 'merged-full.wav',
-    );
+    const mergeStartedAtMs = nowMs();
+    let totalSegmentDataBytes = 0;
+    for (const audioPath of segmentAudioPaths) {
+      const fileStats = await stat(audioPath);
+      totalSegmentDataBytes += Math.max(0, fileStats.size - 44);
+    }
+
+    const finalAudioFormat = totalSegmentDataBytes > WAV_MAX_DATA_BYTES ? 'rf64' : 'wav';
+    const finalOutput = getFinalOutputPath(job, jobId, jobDirectory, finalAudioFormat);
+    await mkdir(finalOutput.outputDirectory, { recursive: true });
+    const mergedAudioPath = finalOutput.outputPath;
     const mergedAudio = await mergeWavFiles(segmentAudioPaths, mergedAudioPath, sampleRate || 22050);
     const finalAudioPath = mergedAudio.path;
+    timing.mergeMs += nowMs() - mergeStartedAtMs;
+    const cleanupStartedAtMs = nowMs();
+    const temporaryAudioCleanup = await cleanupTemporaryAudioFiles(segmentAudioPaths);
+    timing.cleanupMs += nowMs() - cleanupStartedAtMs;
     await writeFile(path.join(jobDirectory, 'segments.csv'), `${segmentRows.join('\n')}\n`, 'utf8');
     if (failedChunkRows.length > 1) {
       await writeFile(path.join(jobDirectory, 'failed-chunks.csv'), `${failedChunkRows.join('\n')}\n`, 'utf8');
     }
+    await writeFile(path.join(finalOutput.outputDirectory, COMPLETED_MARKER_FILENAME), JSON.stringify({
+      completedAt: new Date().toISOString(),
+      finalAudioPath,
+      jobId,
+      originalFilename: job.originalFilename || null,
+    }, null, 2), 'utf8').catch(() => {});
 
     const result = {
       jobId,
@@ -364,18 +525,28 @@ export async function runDocumentJob(jobStore, jobId) {
         failedChunks: failedChunkRows.length - 1,
         skippedChunks,
       },
+      timing: {
+        ...timing,
+        audioSeconds: Math.round((mergedAudio.dataBytes / 2 / (sampleRate || 22050)) * 10) / 10,
+        modelReloadSegmentInterval,
+        realtimeFactor: Math.round((timing.synthesizeMs / 1000 / Math.max(mergedAudio.dataBytes / 2 / (sampleRate || 22050), 1)) * 100) / 100,
+        totalMs: nowMs() - jobStartedAtMs,
+      },
       audio: {
         finalAudioPath,
         finalAudioFormat: mergedAudio.format,
         finalAudioDataBytes: mergedAudio.dataBytes,
+        finalOutputDirectory: finalOutput.outputDirectory,
+        finalOutputDirectoryConfigured: finalOutput.configured,
         modelName,
-        outputDirectory,
-        partAudioPaths,
-        parts: audioParts,
+        outputDirectory: finalOutput.outputDirectory,
+        partAudioPaths: [],
+        parts: [],
         sampleRate: sampleRate || 22050,
-        segmentAudioPaths,
-        skipBrowserDownload: rawText.length > HUGE_BROWSER_DOWNLOAD_CHARS || partAudioPaths.length > 1,
+        segmentAudioPaths: temporaryAudioCleanup.cleaned ? [] : segmentAudioPaths,
+        skipBrowserDownload: rawText.length > HUGE_BROWSER_DOWNLOAD_CHARS,
         speed,
+        temporaryAudioCleanup,
       },
       segments: processedSegments,
       generatedAt: new Date().toISOString(),
@@ -413,6 +584,7 @@ export async function runDocumentJob(jobStore, jobId) {
 export class DocumentJobManager {
   constructor(jobStore) {
     this.jobStore = jobStore;
+    this.activeJobId = null;
     this.queue = [];
     this.running = false;
   }
@@ -431,10 +603,17 @@ export class DocumentJobManager {
     try {
       while (this.queue.length > 0) {
         const jobId = this.queue.shift();
+        this.activeJobId = jobId;
         await runDocumentJob(this.jobStore, jobId);
+        this.activeJobId = null;
       }
     } finally {
+      this.activeJobId = null;
       this.running = false;
     }
+  }
+
+  hasQueuedOrRunning(jobId) {
+    return this.activeJobId === jobId || this.queue.includes(jobId);
   }
 }

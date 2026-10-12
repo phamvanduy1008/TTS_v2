@@ -1,9 +1,113 @@
 import { readFile } from 'node:fs/promises';
 
-import * as ort from 'onnxruntime-node';
 import { phonemize } from 'phonemizer';
 
 import { loadNodeConfig } from './node-text-resources.js';
+
+const CUDA_BACKENDS = new Set(['cuda']);
+const DML_BACKENDS = new Set(['dml', 'directml']);
+const GPU_BACKENDS = new Set(['gpu']);
+
+export function getRequestedInferenceBackend() {
+  return String(process.env.TTS_INFERENCE_BACKEND || 'cpu').trim().toLowerCase() || 'cpu';
+}
+
+function normalizeInferenceBackend(value) {
+  if (GPU_BACKENDS.has(value)) {
+    return process.platform === 'win32' ? 'dml' : 'cuda';
+  }
+
+  if (DML_BACKENDS.has(value)) {
+    return 'dml';
+  }
+
+  if (CUDA_BACKENDS.has(value)) {
+    return 'cuda';
+  }
+
+  return 'cpu';
+}
+
+async function loadOrtRuntime() {
+  const requestedBackend = normalizeInferenceBackend(getRequestedInferenceBackend());
+
+  if (requestedBackend === 'dml') {
+    const ort = await import('onnxruntime-node');
+    return {
+      backend: 'dml',
+      executionProviders: ['dml', 'cpu'],
+      ort,
+    };
+  }
+
+  if (requestedBackend === 'cuda') {
+    try {
+      const ort = await import('onnxruntime-node-gpu');
+      return {
+        backend: 'cuda',
+        executionProviders: ['cuda'],
+        ort,
+      };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(
+        'TTS_INFERENCE_BACKEND=cuda requires the onnxruntime-node-gpu package and a working NVIDIA CUDA setup. '
+        + `Install/configure the GPU runtime first, or run this instance with TTS_INFERENCE_BACKEND=cpu. Details: ${message}`,
+      );
+    }
+  }
+
+  const ort = await import('onnxruntime-node');
+  return {
+    backend: 'cpu',
+    executionProviders: ['cpu'],
+    ort,
+  };
+}
+
+export async function getInferenceRuntimeStatus() {
+  const requestedBackend = normalizeInferenceBackend(getRequestedInferenceBackend());
+
+  if (requestedBackend === 'cpu') {
+    return {
+      backend: 'cpu',
+      error: null,
+      ready: true,
+    };
+  }
+
+  if (requestedBackend === 'dml') {
+    try {
+      await import('onnxruntime-node');
+      return {
+        backend: 'dml',
+        error: null,
+        ready: true,
+      };
+    } catch (error) {
+      return {
+        backend: 'dml',
+        error: error instanceof Error ? error.message : String(error),
+        ready: false,
+      };
+    }
+  }
+
+  try {
+    await import('onnxruntime-node-gpu');
+    return {
+      backend: 'cuda',
+      error: null,
+      ready: true,
+    };
+  } catch (error) {
+    return {
+      backend: 'cuda',
+      error: error instanceof Error ? error.message : String(error),
+      ready: false,
+    };
+  }
+}
 
 function mergePhonemizerOutputPreservePunct(text, phonemes) {
   if (typeof phonemes === 'string') {
@@ -48,21 +152,24 @@ function extractPhonemeId(value) {
 }
 
 export class NodePiperTTS {
-  constructor(voiceConfig, session, modelName) {
+  constructor(voiceConfig, session, modelName, ort, inferenceBackend) {
     this.voiceConfig = voiceConfig;
     this.session = session;
     this.modelName = modelName;
+    this.ort = ort;
+    this.inferenceBackend = inferenceBackend;
   }
 
   static async fromFiles({ modelName, modelPath, configPath }) {
     const configBuffer = await readFile(configPath, 'utf8');
 
     const voiceConfig = JSON.parse(configBuffer);
-    const session = await ort.InferenceSession.create(modelPath, {
-      executionProviders: ['cpu'],
+    const runtime = await loadOrtRuntime();
+    const session = await runtime.ort.InferenceSession.create(modelPath, {
+      executionProviders: runtime.executionProviders,
     });
 
-    return new NodePiperTTS(voiceConfig, session, modelName);
+    return new NodePiperTTS(voiceConfig, session, modelName, runtime.ort, runtime.backend);
   }
 
   async dispose() {
@@ -157,13 +264,13 @@ export class NodePiperTTS {
     }
 
     const inputs = {
-      input: new ort.Tensor('int64', BigInt64Array.from(phonemeIds.map((id) => BigInt(id))), [1, phonemeIds.length]),
-      input_lengths: new ort.Tensor('int64', BigInt64Array.from([BigInt(phonemeIds.length)]), [1]),
-      scales: new ort.Tensor('float32', Float32Array.from([noiseScale, lengthScale, noiseWScale]), [3]),
+      input: new this.ort.Tensor('int64', BigInt64Array.from(phonemeIds.map((id) => BigInt(id))), [1, phonemeIds.length]),
+      input_lengths: new this.ort.Tensor('int64', BigInt64Array.from([BigInt(phonemeIds.length)]), [1]),
+      scales: new this.ort.Tensor('float32', Float32Array.from([noiseScale, lengthScale, noiseWScale]), [3]),
     };
 
     if (this.voiceConfig.num_speakers > 1) {
-      inputs.sid = new ort.Tensor('int64', BigInt64Array.from([BigInt(speakerId)]), [1]);
+      inputs.sid = new this.ort.Tensor('int64', BigInt64Array.from([BigInt(speakerId)]), [1]);
     }
 
     let results = null;

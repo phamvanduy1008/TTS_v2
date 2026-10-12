@@ -4,9 +4,14 @@ import { stat } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
+import { BatchJobManager } from './batch-job-manager.js';
 import { DocumentJobManager } from './document-job-runner.js';
+import { loadLocalEnv } from './env-loader.js';
 import { JobStore } from './job-store.js';
+import { getInferenceRuntimeStatus } from './node-piper-tts.js';
 import { saveUploadedFile } from './upload-store.js';
+
+await loadLocalEnv();
 
 function sendJson(response, statusCode, payload) {
   response.writeHead(statusCode, {
@@ -55,6 +60,21 @@ function extractResumeJobId(urlPath) {
   return match?.[1] || null;
 }
 
+function extractBatchId(urlPath) {
+  const match = urlPath.match(/^\/batch\/([^/]+)$/);
+  return match?.[1] || null;
+}
+
+function extractBatchStartId(urlPath) {
+  const match = urlPath.match(/^\/batch\/([^/]+)\/start$/);
+  return match?.[1] || null;
+}
+
+function extractBatchStopId(urlPath) {
+  const match = urlPath.match(/^\/batch\/([^/]+)\/stop$/);
+  return match?.[1] || null;
+}
+
 async function readJsonBody(request) {
   const chunks = [];
   for await (const chunk of request) {
@@ -95,10 +115,26 @@ function getDownloadFilename(job, jobId, partIndex = null) {
   return `${safeBaseName}.wav`;
 }
 
+async function requireReadyRuntime(response) {
+  const runtime = await getInferenceRuntimeStatus();
+  if (runtime.ready) {
+    return true;
+  }
+
+  sendJson(response, 503, {
+    error: `Runtime ${runtime.backend.toUpperCase()} is not ready: ${runtime.error || 'missing runtime'}`,
+    inferenceBackend: runtime.backend,
+    runtimeError: runtime.error,
+    runtimeReady: false,
+  });
+  return false;
+}
+
 export async function createApiServer({ host = '127.0.0.1', port = 3030 } = {}) {
   const jobStore = new JobStore();
   await jobStore.init();
   const jobManager = new DocumentJobManager(jobStore);
+  const batchManager = new BatchJobManager(jobStore);
 
   const server = http.createServer(async (request, response) => {
     const url = new URL(request.url || '/', `http://${request.headers.host || `${host}:${port}`}`);
@@ -110,7 +146,13 @@ export async function createApiServer({ host = '127.0.0.1', port = 3030 } = {}) 
       }
 
       if (request.method === 'GET' && url.pathname === '/health') {
-        sendJson(response, 200, { ok: true });
+        const runtime = await getInferenceRuntimeStatus();
+        sendJson(response, 200, {
+          inferenceBackend: runtime.backend,
+          ok: true,
+          runtimeError: runtime.error,
+          runtimeReady: runtime.ready,
+        });
         return;
       }
 
@@ -120,7 +162,105 @@ export async function createApiServer({ host = '127.0.0.1', port = 3030 } = {}) 
         return;
       }
 
+      if (request.method === 'POST' && url.pathname === '/batch/scan') {
+        const body = await readJsonBody(request);
+        try {
+          const batch = await batchManager.scan({
+            inputDirectory: body.inputDirectory,
+            modelName: getModelName(body.modelName),
+            outputDirectory: typeof body.outputDirectory === 'string' ? body.outputDirectory : '',
+            speed: getSpeed(body.speed),
+          });
+          sendJson(response, 200, { batch });
+        } catch (error) {
+          sendJson(response, 400, {
+            error: error instanceof Error ? error.message : 'Cannot scan batch input directory',
+          });
+        }
+        return;
+      }
+
+      if (request.method === 'POST' && url.pathname === '/batch/start') {
+        if (!await requireReadyRuntime(response)) {
+          return;
+        }
+
+        const body = await readJsonBody(request);
+        try {
+          const batch = await batchManager.start({
+            inputDirectory: body.inputDirectory,
+            modelName: getModelName(body.modelName),
+            outputDirectory: typeof body.outputDirectory === 'string' ? body.outputDirectory : '',
+            speed: getSpeed(body.speed),
+          });
+          sendJson(response, 202, { batch });
+        } catch (error) {
+          sendJson(response, 409, {
+            error: error instanceof Error ? error.message : 'Cannot start batch',
+          });
+        }
+        return;
+      }
+
+      const batchStartId = extractBatchStartId(url.pathname);
+      if (batchStartId) {
+        if (request.method !== 'POST') {
+          methodNotAllowed(response);
+          return;
+        }
+
+        try {
+          if (!await requireReadyRuntime(response)) {
+            return;
+          }
+
+          const batch = await batchManager.start({ batchId: batchStartId });
+          sendJson(response, 202, { batch });
+        } catch (error) {
+          sendJson(response, error instanceof Error && error.message === 'Batch not found' ? 404 : 409, {
+            error: error instanceof Error ? error.message : 'Cannot start batch',
+          });
+        }
+        return;
+      }
+
+      const batchStopId = extractBatchStopId(url.pathname);
+      if (batchStopId) {
+        if (request.method !== 'POST') {
+          methodNotAllowed(response);
+          return;
+        }
+
+        try {
+          const batch = batchManager.stop(batchStopId);
+          sendJson(response, 202, { batch });
+        } catch {
+          sendJson(response, 404, { error: 'Batch not found' });
+        }
+        return;
+      }
+
+      const batchId = extractBatchId(url.pathname);
+      if (batchId) {
+        if (request.method !== 'GET') {
+          methodNotAllowed(response);
+          return;
+        }
+
+        try {
+          const batch = await batchManager.getSnapshot(batchId);
+          sendJson(response, 200, { batch });
+        } catch {
+          sendJson(response, 404, { error: 'Batch not found' });
+        }
+        return;
+      }
+
       if (request.method === 'POST' && url.pathname === '/jobs') {
+        if (!await requireReadyRuntime(response)) {
+          return;
+        }
+
         const contentType = String(request.headers['content-type'] || '');
         let job = null;
 
@@ -186,9 +326,13 @@ export async function createApiServer({ host = '127.0.0.1', port = 3030 } = {}) 
           return;
         }
 
+        if (!await requireReadyRuntime(response)) {
+          return;
+        }
+
         try {
           const job = await jobStore.getJob(resumeJobId);
-          if (job.status === 'running' || job.status === 'queued') {
+          if ((job.status === 'running' || job.status === 'queued') && jobManager.hasQueuedOrRunning(resumeJobId)) {
             sendJson(response, 409, { error: 'Job is already running or queued' });
             return;
           }

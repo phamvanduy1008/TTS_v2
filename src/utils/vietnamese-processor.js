@@ -32,7 +32,7 @@ function numberToWords(numStr) {
     let num;
     try {
         num = parseInt(numStr, 10);
-    } catch (e) {
+    } catch {
         return numStr;
     }
     
@@ -451,9 +451,8 @@ function convertRomanNumerals(text, config) {
         // I can only precede V or X
         // X can only precede L or C
         // C can only precede D or M
-        // V, L, D cannot be used for subtraction
-        const invalidSubtractive = /I[^VX]|X[^LC]|C[^DM]|[VLD][IVXLCDM]/;
-        // But we need to allow valid subtractive pairs, so check more carefully
+        // V, L, D cannot be used for subtraction.
+        // Check carefully so valid subtractive pairs are still allowed.
         for (let i = 0; i < upperRoman.length - 1; i++) {
             const current = upperRoman[i];
             const next = upperRoman[i + 1];
@@ -536,7 +535,6 @@ function convertRomanNumerals(text, config) {
  * Convert date expressions
  */
 function convertDate(text, config = null) {
-    const originalText = text;
     const matches = [];
     
     // Helper function to validate date values
@@ -608,6 +606,15 @@ function convertDate(text, config = null) {
         }
         return match;
     });
+
+    text = text.replace(/(ngày)\s+(\d{1,2})[/-](\d{1,2})[/-](\d{4})/gi, (match, prefix, day, month, year) => {
+        if (isValidDate(day, month, year)) {
+            const result = `${prefix.toLowerCase()} ${numberToWords(day)} tháng ${numberToWords(month)} năm ${numberToWords(year)}`;
+            matches.push({ pattern: 'ngày DD/MM/YYYY', match, result });
+            return result;
+        }
+        return match;
+    });
     
     // IMPORTANT: DD/MM/YYYY or DD-MM-YYYY (2 separators) must come BEFORE MM-YYYY pattern
     // This ensures "3-3-2026" is read as "ngày 3 tháng 3 năm 2026" not "tháng 3 tháng 3 năm 2026"
@@ -628,7 +635,7 @@ function convertDate(text, config = null) {
     //    Example: "6/2024m" should NOT become "tháng sáu năm hai nghìn không trăm hai mươi bốn m"
     // Rule: If there is 1 "-" or 1 "/" and no "%" next to a number, and the next non-space
     //       character after the match is NOT a letter/digit, read as "tháng [number] năm [number]"
-    text = text.replace(/(?:tháng\s+)?(\d{1,2})\s*[/-]\s*(\d{4})(?![\/-]\d)/g, (match, month, year, offset, fullText) => {
+    text = text.replace(/(?:tháng\s+)?(\d{1,2})\s*[/-]\s*(\d{4})(?![/-]\d)/g, (match, month, year, offset, fullText) => {
         // Check the character immediately after this match for context
         const after = fullText.slice(offset + match.length);
         const nextNonSpace = after.match(/\S/);
@@ -652,7 +659,7 @@ function convertDate(text, config = null) {
     // IMPORTANT: Exclude cases where there's a "%" after (e.g., "6-10%" should be handled as percentage range, not date)
     // Use a more specific negative lookahead that checks if the pattern is followed by digits then "%"
     // This prevents matching "6-1" in "6-10%" by checking if there are more digits before "%"
-    text = text.replace(/(\d{1,2})\s*[/-]\s*(\d{1,2})(?![\/-]\d)(?!\d+\s*%)/g, (match, day, month, offset, fullText) => {
+    text = text.replace(/(\d{1,2})\s*[/-]\s*(\d{1,2})(?![/-]\d)(?!\d+\s*%)/g, (match, day, month, offset, fullText) => {
         // Additional check: if there's a "%" after (with optional whitespace and/or digits), skip this match
         // This handles both "6-10%" (where % is immediately after) and "6-1 0%" (where there are digits before %)
         const afterMatch = fullText.slice(offset + match.length);
@@ -943,9 +950,6 @@ function normalizePunctuation(text) {
     // Normalize ellipsis
     text = text.replace(/\.{3,}/g, '...');
     text = text.replace(/…/g, '...');
-    
-    // Remove multiple punctuation
-    text = text.replace(/([!?.]){2,}/g, '$1');
     
     return text;
 }

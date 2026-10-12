@@ -1,6 +1,4 @@
-/* eslint-disable no-undef */
-
-import { processTextForTTS, chunkText, loadConfig, isDebugEnabled, debugLog } from '../utils/text-cleaner.js';
+import { processTextForTTS, chunkText, loadConfig, isDebugEnabled } from '../utils/text-cleaner.js';
 
 let ortModulePromise = null;
 let phonemizerModulePromise = null;
@@ -25,6 +23,10 @@ function getSharedConfig() {
     sharedConfigPromise = loadConfig();
   }
   return sharedConfigPromise;
+}
+
+function getChunkText(chunk) {
+  return typeof chunk === 'string' ? chunk : String(chunk?.text || '');
 }
 
 // Merge phonemizer output (which may be an array of clause strings) into a single
@@ -363,7 +365,8 @@ export class PiperTTS {
     let chunkIdx = 0;
     
     // Process the text stream
-    for await (const text of textStreamer) {
+    for await (const chunk of textStreamer) {
+      const text = getChunkText(chunk);
       if (text.trim()) {
         try {
           if (this.session && this.voiceConfig) {

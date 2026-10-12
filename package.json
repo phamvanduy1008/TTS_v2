@@ -10,6 +10,8 @@
     "build": "vite build",
     "build:desktop": "node scripts/build-desktop.js",
     "desktop": "npm run build:desktop && electron .",
+    "desktop:worker": "node scripts/run-desktop-instance.js 3031 worker cpu",
+    "desktop:gpu": "node scripts/run-desktop-instance.js 3031 gpu dml",
     "desktop:dev": "node scripts/run-desktop-dev.js",
     "lint": "eslint .",
     "preview": "vite preview",
@@ -37,5 +39,8 @@
     "eslint-plugin-vue": "^10.4.0",
     "prettier": "^3.6.2",
     "vite": "^7.1.1"
+  },
+  "optionalDependencies": {
+    "onnxruntime-node-gpu": "^1.14.0"
   }
 }

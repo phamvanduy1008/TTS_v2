@@ -2,30 +2,7 @@ import { createTextCleaner } from '../../shared/text/text-cleaner-core.js';
 import { buildSortedReplacementMap } from '../../shared/text/text-resource-utils.js';
 
 let acronymMapCache = null;
-let wordReplacementMapCache = null;
 let configCache = null;
-
-async function loadWordReplacementMap() {
-  if (wordReplacementMapCache !== null) {
-    return wordReplacementMapCache;
-  }
-
-  try {
-    const response = await fetch('/data/non-vietnamese-words.csv');
-    if (!response.ok) {
-      console.warn('Failed to load word replacement CSV:', response.statusText);
-      wordReplacementMapCache = new Map();
-      return wordReplacementMapCache;
-    }
-
-    wordReplacementMapCache = buildSortedReplacementMap(await response.text());
-    return wordReplacementMapCache;
-  } catch (error) {
-    console.error('Error loading word replacement CSV:', error);
-    wordReplacementMapCache = new Map();
-    return wordReplacementMapCache;
-  }
-}
 
 async function loadAcronymMap() {
   if (acronymMapCache !== null) {
@@ -58,7 +35,7 @@ export async function loadConfig() {
     const response = await fetch('/data/config.json');
     if (!response.ok) {
       console.warn('Failed to load config JSON:', response.statusText);
-      configCache = { enableTransliteration: true, debug: false };
+      configCache = { enableTransliteration: false, debug: false };
       return configCache;
     }
 
@@ -66,7 +43,7 @@ export async function loadConfig() {
     return configCache;
   } catch (error) {
     console.warn('Failed to load config, using defaults:', error);
-    configCache = { enableTransliteration: true, debug: false };
+    configCache = { enableTransliteration: false, debug: false };
     return configCache;
   }
 }
@@ -74,16 +51,13 @@ export async function loadConfig() {
 const browserTextCleaner = createTextCleaner({
   loadAcronymMap,
   loadConfig,
-  loadWordReplacementMap,
 });
 
 export const {
-  applyTransliteration,
   chunkText,
   cleanTextForTTS,
   convertAcronyms,
   debugLog,
   isDebugEnabled,
   processTextForTTS,
-  replaceNonVietnameseWords,
 } = browserTextCleaner;

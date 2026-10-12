@@ -1,11 +1,42 @@
 import { processVietnameseText } from '../../src/utils/vietnamese-processor.js';
-import { transliterateWord } from '../../src/utils/transliterator.js';
-import { isVietnameseWord } from '../../src/utils/vietnamese-detector.js';
 
-const TRANSLITERATION_SKIP_WORDS = new Set(['mc']);
-const CSV_REPLACEMENT_SKIP_WORDS = new Set(['dua', 'kia', 'muon', 'ria']);
+export function createTextCleaner({ loadAcronymMap, loadConfig }) {
+  const SHORT_SENTENCE_CHARS = 34;
+  const SMART_GROUP_MAX_CHARS = 145;
+  const WORD_BOUNDARY = '[^\\w\\u00C0-\\u1EFF]';
+  const INITIALISM_READINGS = {
+    A: 'ây',
+    B: 'bi',
+    C: 'si',
+    D: 'đi',
+    E: 'i',
+    F: 'ép',
+    G: 'gi',
+    H: 'hát',
+    I: 'ai',
+    J: 'giây',
+    K: 'kây',
+    L: 'eo',
+    M: 'em',
+    N: 'en',
+    O: 'ô',
+    P: 'pi',
+    Q: 'kiu',
+    R: 'a',
+    S: 'ét',
+    T: 'ti',
+    U: 'u',
+    V: 'vi',
+    W: 'đắp liu',
+    X: 'ích',
+    Y: 'wai',
+    Z: 'dét',
+  };
 
-export function createTextCleaner({ loadAcronymMap, loadConfig, loadWordReplacementMap }) {
+  function escapeRegex(value) {
+    return String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  }
+
   function isDebugEnabled(config) {
     return config && config.debug === true;
   }
@@ -14,84 +45,6 @@ export function createTextCleaner({ loadAcronymMap, loadConfig, loadWordReplacem
     if (isDebugEnabled(config)) {
       console.log(`[DEBUG] ${step}:`, data);
     }
-  }
-
-  function applyTransliteration(text, replacementMap, config = null) {
-    if (!text || typeof text !== 'string') {
-      return text;
-    }
-
-    const wordBoundaryRegex = /(?:^|[^\w\u00C0-\u1EFF])([\w\u00C0-\u1EFF]+)(?=[^\w\u00C0-\u1EFF]|$)/g;
-    let result = text;
-    const processedWords = new Set();
-    const transliteratedWords = [];
-    let match;
-
-    while ((match = wordBoundaryRegex.exec(text)) !== null) {
-      const word = match[1];
-      const wordLower = word.toLowerCase();
-
-      if (processedWords.has(wordLower)) {
-        continue;
-      }
-      processedWords.add(wordLower);
-
-      if (replacementMap.has(wordLower)) {
-        if (isDebugEnabled(config)) {
-          debugLog(config, 'Transliteration', {
-            word,
-            action: 'SKIPPED (in CSV map)',
-          });
-        }
-        continue;
-      }
-
-      const isVietnamese = isVietnameseWord(word) || isVietnameseWord(wordLower);
-      if (isVietnamese) {
-        if (isDebugEnabled(config)) {
-          debugLog(config, 'Transliteration', {
-            word,
-            action: 'SKIPPED (Vietnamese)',
-            hasDiacritics: /[àáảãạăằắẳẵặâầấẩẫậèéẻẽẹêềếểễệìíỉĩịòóỏõọôồốổỗộơờớởỡợùúủũụưừứửữựỳýỷỹỵđ]/i.test(word),
-          });
-        }
-        continue;
-      }
-
-      if (word.length === 1) {
-        if (isDebugEnabled(config)) {
-          debugLog(config, 'Transliteration', { word, action: 'SKIPPED (single character)' });
-        }
-        continue;
-      }
-
-      if (TRANSLITERATION_SKIP_WORDS.has(wordLower)) {
-        continue;
-      }
-
-      const transliterated = transliterateWord(word);
-      transliteratedWords.push({ word, transliterated });
-
-      const escapedWord = word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      const notWordChar = '[^\\w\\u00C0-\\u1EFF]';
-      const regex = new RegExp(`(?:^|(${notWordChar}))(${escapedWord})(?=${notWordChar}|$)`, 'gi');
-
-      result = result.replace(regex, (_fullMatch, boundary, wordPart) => {
-        const replacement = wordPart && wordPart[0] === wordPart[0].toUpperCase()
-          ? transliterated.charAt(0).toUpperCase() + transliterated.slice(1)
-          : transliterated;
-        return `${boundary || ''}${replacement}`;
-      });
-    }
-
-    if (isDebugEnabled(config) && transliteratedWords.length > 0) {
-      debugLog(config, 'Transliteration', {
-        totalWords: transliteratedWords.length,
-        words: transliteratedWords,
-      });
-    }
-
-    return result;
   }
 
   async function convertAcronyms(text, acronymMap, config = null) {
@@ -103,10 +56,10 @@ export function createTextCleaner({ loadAcronymMap, loadConfig, loadWordReplacem
     const convertedAcronyms = [];
 
     for (const [acronym, transliteration] of acronymMap) {
-      const escapedAcronym = acronym.replace(/[+?^${}()|[\]\\]/g, '\\$&');
-      const regex = new RegExp(`\\b${escapedAcronym}\\b`, 'gi');
+      const escapedAcronym = escapeRegex(acronym);
+      const regex = new RegExp(`(^|${WORD_BOUNDARY})(${escapedAcronym})(?=${WORD_BOUNDARY}|$)`, 'gi');
       const beforeReplace = result;
-      result = result.replace(regex, transliteration);
+      result = result.replace(regex, (_match, boundary) => `${boundary || ''}${transliteration}`);
 
       if (isDebugEnabled(config) && beforeReplace !== result) {
         convertedAcronyms.push({ acronym, transliteration });
@@ -123,37 +76,37 @@ export function createTextCleaner({ loadAcronymMap, loadConfig, loadWordReplacem
     return result;
   }
 
-  async function replaceNonVietnameseWords(text, replacementMap, config = null) {
-    if (!text || typeof text !== 'string' || !replacementMap || replacementMap.size === 0) {
+  function spellInitialisms(text, config = null) {
+    if (!text || typeof text !== 'string') {
       return text;
     }
 
-    let result = text;
-    const replacedWords = [];
+    const convertedInitialisms = [];
+    const initialismRegex = new RegExp(`(^|${WORD_BOUNDARY})([A-Z]{2,}(?:[./][A-Z0-9]{1,})*)(?=${WORD_BOUNDARY}|$)`, 'g');
 
-    for (const [original, transliteration] of replacementMap) {
-      if (CSV_REPLACEMENT_SKIP_WORDS.has(original)) {
-        continue;
+    const result = text.replace(initialismRegex, (match, boundary, token) => {
+      const letters = Array.from(token.replace(/[^A-Z]/g, ''));
+      if (letters.length < 2) {
+        return match;
       }
 
-      const escapedOriginal = original.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      const regex = new RegExp(`\\b${escapedOriginal}\\b`, 'gi');
-      const beforeReplace = result;
-      result = result.replace(regex, (match) => (
-        match[0] === match[0].toUpperCase()
-          ? transliteration.charAt(0).toUpperCase() + transliteration.slice(1)
-          : transliteration
-      ));
+      const reading = letters
+        .map((letter) => INITIALISM_READINGS[letter])
+        .filter(Boolean)
+        .join(' ');
 
-      if (isDebugEnabled(config) && beforeReplace !== result) {
-        replacedWords.push({ original, transliteration });
+      if (!reading) {
+        return match;
       }
-    }
 
-    if (isDebugEnabled(config) && replacedWords.length > 0) {
-      debugLog(config, 'CSV Word Replacement', {
-        totalReplacements: replacedWords.length,
-        words: replacedWords.slice(0, 20),
+      convertedInitialisms.push({ token, reading });
+      return `${boundary || ''}${reading}`;
+    });
+
+    if (isDebugEnabled(config) && convertedInitialisms.length > 0) {
+      debugLog(config, 'Initialism Spelling', {
+        totalInitialisms: convertedInitialisms.length,
+        initialisms: convertedInitialisms,
       });
     }
 
@@ -169,9 +122,9 @@ export function createTextCleaner({ loadAcronymMap, loadConfig, loadWordReplacem
 
     return text
       .replace(emojiRegex, '')
-      .replace(/[\\()Â¯]/g, '')
-      .replace(/["""]/g, '')
-      .replace(/\sâ€”/g, '.')
+      .replace(/[\\()]/g, '')
+      .replace(/[\u201C\u201D"]/g, '')
+      .replace(/\s[\u2014\u2013]\s/g, '. ')
       .replace(/\b_\b/g, ' ')
       .replace(/(?<!\d)-(?!\d)/g, ' ')
       .replace(/[^\u0000-\u024F\u1E00-\u1EFF]/g, '')
@@ -194,7 +147,11 @@ export function createTextCleaner({ loadAcronymMap, loadConfig, loadWordReplacem
       debugLog(config, 'Step 1: Text Cleaning', { before: text, after: cleanedText });
     }
 
-    const vietnameseProcessedText = processVietnameseText(cleanedText, config);
+    const vietnameseProcessedText = cleanedText
+      .split(/\n{2,}/)
+      .map((paragraph) => processVietnameseText(paragraph, config))
+      .filter(Boolean)
+      .join('\n\n');
     if (isDebugEnabled(config)) {
       debugLog(config, 'Step 2: Vietnamese Processing', {
         before: cleanedText,
@@ -202,46 +159,22 @@ export function createTextCleaner({ loadAcronymMap, loadConfig, loadWordReplacem
       });
     }
 
-    const mappingInput = vietnameseProcessedText.toLowerCase();
-    if (isDebugEnabled(config)) {
-      debugLog(config, 'Step 2.5: Lowercase Normalization', {
-        before: vietnameseProcessedText,
-        after: mappingInput,
-      });
-    }
-
     const acronymMap = await loadAcronymMap();
     if (isDebugEnabled(config)) {
       debugLog(config, 'Acronym Map Loaded', { totalEntries: acronymMap.size });
     }
-    const textAfterAcronymConversion = await convertAcronyms(mappingInput, acronymMap, config);
 
-    const replacementMap = await loadWordReplacementMap();
+    const knownAcronymText = await convertAcronyms(vietnameseProcessedText, acronymMap, config);
+    const initialismText = spellInitialisms(knownAcronymText, config);
+    const mappingInput = initialismText.toLowerCase();
     if (isDebugEnabled(config)) {
-      debugLog(config, 'CSV Map Loaded', { totalEntries: replacementMap.size });
-    }
-    const textAfterWordReplacement = await replaceNonVietnameseWords(
-      textAfterAcronymConversion,
-      replacementMap,
-      config,
-    );
-
-    let processedText = textAfterWordReplacement;
-    if (config.enableTransliteration) {
-      processedText = applyTransliteration(textAfterWordReplacement, replacementMap, config);
-      if (isDebugEnabled(config)) {
-        debugLog(config, 'Step 4.5: Transliteration', {
-          before: textAfterWordReplacement,
-          after: processedText,
-          enabled: true,
-        });
-      }
-    } else if (isDebugEnabled(config)) {
-      debugLog(config, 'Step 4.5: Transliteration', {
-        enabled: false,
-        skipped: true,
+      debugLog(config, 'Step 2.5: Lowercase Normalization', {
+        before: initialismText,
+        after: mappingInput,
       });
     }
+
+    const processedText = await convertAcronyms(mappingInput, acronymMap, config);
 
     if (isDebugEnabled(config)) {
       debugLog(config, 'Preprocessing Complete', { original: text, final: processedText });
@@ -263,32 +196,27 @@ export function createTextCleaner({ loadAcronymMap, loadConfig, loadWordReplacem
       });
     }
 
-    const lines = text.split('\n');
+    const paragraphs = text
+      .replace(/\r\n/g, '\n')
+      .split(/\n{2,}/)
+      .map((paragraph) => paragraph.trim())
+      .filter(Boolean);
     const chunks = [];
 
-    for (const line of lines) {
-      if (line.trim() === '') {
-        continue;
-      }
-
-      const processedLine = /[.!?]$/.test(line.trim()) ? line : `${line.trim()}.`;
-      const sentences = processedLine.split(/(?<=[.!?])(?=\s+|$)/);
-
-      for (const sentence of sentences) {
-        const trimmedSentence = sentence.trim();
-        if (trimmedSentence) {
-          chunks.push(trimmedSentence);
-        }
-      }
+    for (const paragraph of paragraphs) {
+      chunks.push(...createSmartChunksForParagraph(paragraph));
     }
+
+    markParagraphPauses(chunks);
 
     if (isDebugEnabled(config)) {
       debugLog(config, 'Step 5: Text Chunking Complete', {
         totalChunks: chunks.length,
         chunks: chunks.map((chunk, idx) => ({
           index: idx + 1,
-          text: chunk,
-          length: chunk.length,
+          text: chunk.text,
+          length: chunk.text.length,
+          pause: chunk.pause,
         })),
       });
     }
@@ -296,14 +224,108 @@ export function createTextCleaner({ loadAcronymMap, loadConfig, loadWordReplacem
     return chunks;
   }
 
+  function createSmartChunksForParagraph(paragraph) {
+    const processedParagraph = /[.!?…]$/.test(paragraph.trim())
+      ? paragraph
+      : `${paragraph.trim()}.`;
+    const sentences = processedParagraph
+      .split(/(?<=[.!?…])(?=\s+|$)/)
+      .map((sentence) => sentence.trim())
+      .filter(Boolean);
+    const chunks = [];
+    let buffer = '';
+
+    for (const sentence of sentences) {
+      const candidate = buffer ? `${buffer} ${sentence}` : sentence;
+      const canGroup = buffer
+        && shouldGroupSentence(buffer, sentence)
+        && candidate.length <= SMART_GROUP_MAX_CHARS;
+
+      if (!buffer || canGroup) {
+        buffer = candidate;
+        continue;
+      }
+
+      chunks.push(createChunk(buffer));
+      buffer = sentence;
+    }
+
+    if (buffer) {
+      chunks.push(createChunk(buffer));
+    }
+
+    if (chunks.length) {
+      chunks[chunks.length - 1].pause = upgradePause(chunks[chunks.length - 1].pause, 'paragraph');
+    }
+
+    return chunks;
+  }
+
+  function shouldGroupSentence(previousText, nextSentence) {
+    if (/[?!…]\s*$/.test(previousText)) {
+      return false;
+    }
+
+    if (/[?!]\s*$/.test(nextSentence)) {
+      return false;
+    }
+
+    return previousText.length <= SHORT_SENTENCE_CHARS || nextSentence.length <= SHORT_SENTENCE_CHARS;
+  }
+
+  function createChunk(text) {
+    return {
+      pause: inferPauseType(text),
+      text,
+    };
+  }
+
+  function inferPauseType(text) {
+    const value = String(text || '').trim();
+
+    if (/…|\.\.\.\s*$/.test(value)) {
+      return 'ellipsis';
+    }
+
+    if (/[?!]\s*$/.test(value)) {
+      return 'expressive';
+    }
+
+    if (/[.]\s*$/.test(value)) {
+      return value.length <= SHORT_SENTENCE_CHARS ? 'short-sentence' : 'sentence';
+    }
+
+    if (/[,;:]\s*$/.test(value)) {
+      return 'clause';
+    }
+
+    return 'boundary';
+  }
+
+  function markParagraphPauses(chunks) {
+    for (let index = 0; index < chunks.length - 1; index += 1) {
+      if (chunks[index].pause === 'paragraph') {
+        continue;
+      }
+
+      if (chunks[index + 1].pause === 'paragraph' && chunks[index].text.length <= SHORT_SENTENCE_CHARS) {
+        chunks[index].pause = upgradePause(chunks[index].pause, 'short-sentence');
+      }
+    }
+  }
+
+  function upgradePause(current, next) {
+    const order = ['boundary', 'clause', 'short-sentence', 'sentence', 'expressive', 'ellipsis', 'paragraph'];
+    return order.indexOf(next) > order.indexOf(current) ? next : current;
+  }
+
   return {
-    applyTransliteration,
     chunkText,
     cleanTextForTTS,
     convertAcronyms,
     debugLog,
     isDebugEnabled,
     processTextForTTS,
-    replaceNonVietnameseWords,
+    spellInitialisms,
   };
 }

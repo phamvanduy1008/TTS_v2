@@ -180,3 +180,117 @@ export function mergeFloat32Chunks(chunks) {
 
   return merged;
 }
+
+export function mergeFloat32ChunksWithPauses(chunks, sampleRate, options = {}) {
+  const {
+    fadeSeconds = 0.008,
+    includeTrailingPause = false,
+  } = options;
+  const normalizedChunks = chunks
+    .map((chunk) => {
+      if (chunk && typeof chunk === 'object' && chunk.samples) {
+        return {
+          samples: chunk.samples,
+          pause: chunk.pause || chunk.pauseType || '',
+          text: chunk.text || '',
+        };
+      }
+
+      return {
+        pause: '',
+        samples: chunk,
+        text: '',
+      };
+    })
+    .filter(({ samples }) => samples?.length);
+
+  const pauseLengths = normalizedChunks.map((chunk, index) => {
+    if (!includeTrailingPause && index === normalizedChunks.length - 1) {
+      return 0;
+    }
+
+    return Math.round(sampleRate * getPauseSecondsForText(chunk));
+  });
+  const totalLength = normalizedChunks.reduce((sum, { samples }, index) => (
+    sum + samples.length + pauseLengths[index]
+  ), 0);
+  const merged = new Float32Array(totalLength);
+  let offset = 0;
+
+  for (let index = 0; index < normalizedChunks.length; index += 1) {
+    const samples = applyEdgeFade(normalizedChunks[index].samples, sampleRate, fadeSeconds);
+    merged.set(samples, offset);
+    offset += samples.length + pauseLengths[index];
+  }
+
+  return merged;
+}
+
+function applyEdgeFade(samples, sampleRate, fadeSeconds) {
+  const faded = new Float32Array(samples);
+  const fadeSamples = Math.min(
+    Math.floor(sampleRate * fadeSeconds),
+    Math.floor(faded.length / 2),
+  );
+
+  if (fadeSamples <= 1) {
+    return faded;
+  }
+
+  for (let index = 0; index < fadeSamples; index += 1) {
+    const gain = index / fadeSamples;
+    faded[index] *= gain;
+    faded[faded.length - 1 - index] *= gain;
+  }
+
+  return faded;
+}
+
+function getPauseSecondsForText(chunk) {
+  const value = typeof chunk === 'string'
+    ? chunk.trim()
+    : String(chunk?.text || '').trim();
+  const pause = typeof chunk === 'object' ? chunk.pause : '';
+
+  if (pause === 'ellipsis' || /…|\.\.\.\s*$/.test(value)) {
+    return 0.48;
+  }
+
+  if (pause === 'paragraph') {
+    return 0.36;
+  }
+
+  if (pause === 'expressive') {
+    return 0.28;
+  }
+
+  if (pause === 'short-sentence') {
+    return 0.13;
+  }
+
+  if (pause === 'sentence') {
+    return 0.2;
+  }
+
+  if (pause === 'clause') {
+    return 0.09;
+  }
+
+  if (!value) {
+    return 0.07;
+  }
+
+  if (/[?!]\s*$/.test(value)) {
+    return 0.28;
+  }
+
+  if (/[.?!]\s*$/.test(value)) {
+    return value.length <= 34 ? 0.13 : 0.2;
+  }
+
+  if (/[,;:]\s*$/.test(value)) {
+    return 0.09;
+  }
+
+  return 0.07;
+}

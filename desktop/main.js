@@ -3,10 +3,17 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { createApiServer } from '../server/api-server.js';
+import { loadLocalEnv } from '../server/env-loader.js';
+
+await loadLocalEnv();
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(__dirname, '..');
-const localApiBase = 'http://127.0.0.1:3030';
+const instanceId = String(process.env.TTS_DESKTOP_INSTANCE_ID || 'main').trim() || 'main';
+const inferenceBackend = String(process.env.TTS_INFERENCE_BACKEND || 'cpu').trim().toLowerCase() || 'cpu';
+const localApiHost = process.env.TTS_LOCAL_HOST || '127.0.0.1';
+const localApiPort = Number(process.env.TTS_LOCAL_PORT || 3030);
+const localApiBase = `http://${localApiHost}:${localApiPort}`;
 
 let mainWindow = null;
 let localApi = null;
@@ -28,7 +35,7 @@ async function startLocalApi() {
   }
 
   try {
-    localApi = await createApiServer({ host: '127.0.0.1', port: 3030 });
+    localApi = await createApiServer({ host: localApiHost, port: localApiPort });
     await localApi.start();
   } catch (error) {
     if (error?.code === 'EADDRINUSE' && await healthCheck()) {
@@ -54,7 +61,9 @@ async function createMainWindow() {
     minHeight: 720,
     minWidth: 1100,
     show: false,
-    title: 'Local TTS Studio',
+    title: instanceId === 'main'
+      ? `Local TTS Studio (${inferenceBackend})`
+      : `Local TTS Studio ${instanceId} (${inferenceBackend}, ${localApiPort})`,
     webPreferences: {
       contextIsolation: true,
       nodeIntegration: false,
@@ -74,13 +83,30 @@ async function createMainWindow() {
 
   const devServerUrl = process.env.VITE_DEV_SERVER_URL;
   if (devServerUrl) {
-    await mainWindow.loadURL(devServerUrl);
+    const url = new URL(devServerUrl);
+    url.searchParams.set('ttsApiHost', localApiHost);
+    url.searchParams.set('ttsApiPort', String(localApiPort));
+    url.searchParams.set('ttsInferenceBackend', inferenceBackend);
+    url.searchParams.set('ttsInstanceId', instanceId);
+    await mainWindow.loadURL(url.toString());
   } else {
-    await mainWindow.loadFile(path.join(projectRoot, 'dist', 'index.html'));
+    await mainWindow.loadFile(path.join(projectRoot, 'dist', 'index.html'), {
+      query: {
+        ttsApiHost: localApiHost,
+        ttsApiPort: String(localApiPort),
+        ttsInferenceBackend: inferenceBackend,
+        ttsInstanceId: instanceId,
+      },
+    });
   }
 }
 
-const gotLock = app.requestSingleInstanceLock();
+if (instanceId !== 'main') {
+  const defaultUserData = app.getPath('userData');
+  app.setPath('userData', path.join(path.dirname(defaultUserData), `${path.basename(defaultUserData)}-${instanceId}`));
+}
+
+const gotLock = app.requestSingleInstanceLock({ instanceId, localApiPort });
 if (!gotLock) {
   app.quit();
 } else {

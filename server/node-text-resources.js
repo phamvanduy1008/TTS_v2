@@ -11,7 +11,6 @@ const projectRoot = path.resolve(__dirname, '..');
 
 let acronymMapCache = null;
 let configCache = null;
-let wordReplacementMapCache = null;
 
 function resolveProjectPath(...parts) {
   return path.join(projectRoot, ...parts);
@@ -33,7 +32,7 @@ async function loadNodeConfig() {
     return configCache;
   } catch (error) {
     console.warn('Failed to load config, using defaults:', error);
-    configCache = { enableTransliteration: true, debug: false };
+    configCache = { enableTransliteration: false, debug: false };
     return configCache;
   }
 }
@@ -48,20 +47,9 @@ async function loadNodeAcronymMap() {
   return acronymMapCache;
 }
 
-async function loadNodeWordReplacementMap() {
-  if (wordReplacementMapCache !== null) {
-    return wordReplacementMapCache;
-  }
-
-  const raw = await readFile(resolveDataPath('non-vietnamese-words.csv'), 'utf8');
-  wordReplacementMapCache = buildSortedReplacementMap(raw);
-  return wordReplacementMapCache;
-}
-
 const nodeTextCleaner = createTextCleaner({
   loadAcronymMap: loadNodeAcronymMap,
   loadConfig: loadNodeConfig,
-  loadWordReplacementMap: loadNodeWordReplacementMap,
 });
 
-export { loadNodeAcronymMap, loadNodeConfig, loadNodeWordReplacementMap, nodeTextCleaner, projectRoot, resolveProjectPath };
+export { loadNodeAcronymMap, loadNodeConfig, nodeTextCleaner, projectRoot, resolveProjectPath };
